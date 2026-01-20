@@ -96,9 +96,18 @@ func (a *App) HandleLogin(r *ghttp.Request) {
 		r.Response.WriteStatus(http.StatusBadRequest, "username/password required")
 		return
 	}
+	ip := clientIP(r)
+	if lock, err := a.store.IPLocked(ip); err == nil && lock != nil && lock.After(time.Now()) {
+		r.Response.WriteStatus(http.StatusTooManyRequests, "ip locked until "+lock.Format(time.RFC3339))
+		return
+	}
 
 	user, err := a.store.GetUserByUsername(req.Username)
 	if err != nil {
+		if lockUntil, _ := a.store.RecordIPFailure(ip); lockUntil != nil {
+			r.Response.WriteStatus(http.StatusTooManyRequests, "ip locked until "+lockUntil.Format(time.RFC3339))
+			return
+		}
 		r.Response.WriteStatus(http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -113,6 +122,10 @@ func (a *App) HandleLogin(r *ghttp.Request) {
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
+		if lockUntil, _ := a.store.RecordIPFailure(ip); lockUntil != nil {
+			r.Response.WriteStatus(http.StatusTooManyRequests, "ip locked until "+lockUntil.Format(time.RFC3339))
+			return
+		}
 		if lockUntil, _ := a.store.RecordFailureAndMaybeLock(user.ID); lockUntil != nil {
 			r.Response.WriteStatus(http.StatusTooManyRequests, "account locked until "+lockUntil.Format(time.RFC3339))
 			return
@@ -149,6 +162,9 @@ func (a *App) HandleLogin(r *ghttp.Request) {
 
 	if err := a.store.RecordAttempt(user.ID, true); err != nil {
 		log.Printf("record attempt: %v", err)
+	}
+	if err := a.store.ClearIPLock(ip); err != nil {
+		log.Printf("clear ip lock: %v", err)
 	}
 	if err := a.store.ClearLock(user.ID); err != nil {
 		log.Printf("clear lock: %v", err)
@@ -611,4 +627,22 @@ func (a *App) requireSession(r *ghttp.Request) (User, error) {
 		return User{}, errors.New("locked")
 	}
 	return user, nil
+}
+
+// clientIP extracts the real client IP, preferring X-Forwarded-For / X-Real-IP when present.
+func clientIP(r *ghttp.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			return strings.TrimSpace(parts[0])
+		}
+	}
+	if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
+		return xr
+	}
+	if ip := r.GetClientIp(); ip != "" {
+		return ip
+	}
+	host, _, _ := net.SplitHostPort(r.Request.RemoteAddr)
+	return host
 }

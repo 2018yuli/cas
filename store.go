@@ -79,6 +79,11 @@ func (s *Store) migrate() error {
 			success BOOLEAN NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_login_attempts_user_time ON login_attempts(user_id, attempted_at DESC);`,
+		`CREATE TABLE IF NOT EXISTS ip_locks (
+			ip TEXT PRIMARY KEY,
+			failures INTEGER NOT NULL DEFAULT 0,
+			locked_until TIMESTAMP
+		);`,
 	}
 	for _, stmt := range schema {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -300,6 +305,60 @@ func (s *Store) RecordFailureAndMaybeLock(userID int64) (*time.Time, error) {
 
 func (s *Store) ClearLock(userID int64) error {
 	_, err := s.db.Exec(`UPDATE users SET locked_until = NULL WHERE id = ?`, userID)
+	return err
+}
+
+func (s *Store) IPLocked(ip string) (*time.Time, error) {
+	var t sql.NullTime
+	err := s.db.QueryRow(`SELECT locked_until FROM ip_locks WHERE ip = ?`, ip).Scan(&t)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if t.Valid && t.Time.After(time.Now()) {
+		return &t.Time, nil
+	}
+	return nil, nil
+}
+
+func (s *Store) RecordIPFailure(ip string) (*time.Time, error) {
+	var failures int
+	var locked sql.NullTime
+	err := s.db.QueryRow(`SELECT failures, locked_until FROM ip_locks WHERE ip = ?`, ip).Scan(&failures, &locked)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := s.db.Exec(`INSERT INTO ip_locks(ip, failures) VALUES(?, 0)`, ip); err != nil {
+			return nil, err
+		}
+		failures = 0
+	} else if err != nil {
+		return nil, err
+	}
+	failures++
+	var lockUntil *time.Time
+	if failures >= 3 {
+		multiplier := failures - 3
+		if multiplier > 20 {
+			multiplier = 20
+		}
+		d := baseLockDuration * time.Duration(1<<multiplier)
+		if d > maxLockDuration {
+			d = maxLockDuration
+		}
+		t := time.Now().Add(d)
+		lockUntil = &t
+	}
+	if lockUntil != nil {
+		_, err = s.db.Exec(`UPDATE ip_locks SET failures = ?, locked_until = ? WHERE ip = ?`, failures, *lockUntil, ip)
+	} else {
+		_, err = s.db.Exec(`UPDATE ip_locks SET failures = ?, locked_until = NULL WHERE ip = ?`, failures, ip)
+	}
+	return lockUntil, err
+}
+
+func (s *Store) ClearIPLock(ip string) error {
+	_, err := s.db.Exec(`UPDATE ip_locks SET failures = 0, locked_until = NULL WHERE ip = ?`, ip)
 	return err
 }
 

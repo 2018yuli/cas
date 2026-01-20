@@ -1,5 +1,8 @@
 **Security Warning: This project is not security-hardened. Do NOT expose it directly to the public internet without an audit, hardening, and your own threat model.**
+
 **Proxy Restriction: This gateway only intends to proxy Webtop. Other targets will be rejected automatical by inner rule.**
+
+**Thanks:** Built with the help of Codex.
 
 # Webtop User Center
 
