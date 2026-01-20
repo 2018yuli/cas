@@ -17,11 +17,16 @@ func main() {
 		log.Fatalf("ensure defaults: %v", err)
 	}
 
+	var ts *core.TunnelServer
 	if cfg.TunnelEnabled {
-		ts := &core.TunnelServer{Cfg: cfg.Tunnel}
-		_ = ts.Start(context.Background())
+		var err error
+		ts, err = core.StartTunnelServer(context.Background(), cfg.Tunnel)
+		if err != nil {
+			log.Fatalf("start tunnel server: %v", err)
+		}
 	}
 
-	app := core.NewApp(store)
+	app := core.NewApp(store, cfg)
+	app.SetTunnelServer(ts)
 	core.RunServer(cfg, app)
 }

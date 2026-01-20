@@ -26,6 +26,9 @@
   </header>
   <div id="error"></div>
   <div class="container" id="list"></div>
+  <div style="text-align:center; padding:12px; font-size:12px;">
+    <a href="https://github.com/2018yuli/cas" target="_blank" rel="noopener">cas</a>
+  </div>
 
   <script>
     async function load() {
@@ -48,7 +51,7 @@
           div.innerHTML = `
             <div class="name">${w.name}</div>
             <div class="url">${w.target_url}</div>
-            <a class="btn" href="/webtop/${w.id}" target="_blank">进入</a>
+            <a class="btn" href="/webtop/${w.id}/" target="_blank">进入</a>
           `;
           list.appendChild(div);
         });

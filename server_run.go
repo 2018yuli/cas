@@ -19,16 +19,14 @@ func RunServer(cfg Config, app *App) {
 	view := gview.New()
 	view.AddPath("template")
 	s.SetView(view)
-	app.DisableAdmin()
+	if !cfg.AdminEnabled {
+		app.DisableAdmin()
+	}
 	app.RegisterRoutes(s)
 
 	log.Printf("user-center server listening on :%d", cfg.Port)
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
 		log.Printf("user-center server https on :%d", cfg.HTTPSPort)
-	}
-
-	if cfg.SyncEnabled && cfg.SyncURL != "" {
-		go startWebtopSync(cfg, app.store)
 	}
 	s.Run()
 }

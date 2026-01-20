@@ -406,6 +406,21 @@ func (s *Store) UpdateWebtop(id int64, name, target string, enabled bool) error 
 	return err
 }
 
+func (s *Store) DeleteWebtop(id int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM role_webtops WHERE webtop_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM webtops WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) ReplaceWebtops(webtops []Webtop) error {
 	tx, err := s.db.Begin()
 	if err != nil {

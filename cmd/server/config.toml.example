@@ -10,11 +10,9 @@ secret = "change-me-admin-secret"
 
 [tunnel]
 enabled = true
-# server 监听绑定地址与端口，client 主动连上来
-server_addr = "0.0.0.0"
-data_port = 9101
+server_addr = "0.0.0.0"   # server 监听地址
+data_port = 9101          # server 监听端口
 secret = "change-me-tunnel-secret"
-# 如需为隧道开启 TLS，填 cert/key，client 需开启 tls_insecure 或信任证书
 tls_enabled = false
 tls_cert = ""
 tls_key = ""

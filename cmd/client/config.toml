@@ -6,17 +6,15 @@ tls_key = ""
 
 [admin]
 enabled = true
-secret = "" # 留空则用角色校验，非空则请求头需携带 X-Admin-Secret
+secret = "" # leave empty to use role-based admin check
 
 [tunnel]
 enabled = true
+# client 出站连接 server 的公网地址:端口
 server_addr = "127.0.0.1"
-control_port = 9100
 data_port = 9101
-public_port = 10080
-local_target = "192.168.245.129:3001"
 secret = "change-me-tunnel-secret"
-reconnect_sec = 5
-
-[sync]
-secret = "123"
+# 隧道 TLS 选项：若 server 开启 tls_enabled，client 建议设 tls_insecure=true 或信任 cert
+tls_enabled = false
+tls_insecure = true
+conn_count = 4

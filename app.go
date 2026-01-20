@@ -1,11 +1,17 @@
 package app
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"errors"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -21,15 +27,21 @@ import (
 
 type App struct {
 	store         *Store
+	cfg           Config
 	adminDisabled bool
+	tunnel        *TunnelServer
 }
 
-func NewApp(store *Store) *App {
-	return &App{store: store}
+func NewApp(store *Store, cfg Config) *App {
+	return &App{store: store, cfg: cfg}
 }
 
 func (a *App) DisableAdmin() {
 	a.adminDisabled = true
+}
+
+func (a *App) SetTunnelServer(ts *TunnelServer) {
+	a.tunnel = ts
 }
 
 func (a *App) RegisterRoutes(s *ghttp.Server) {
@@ -37,7 +49,6 @@ func (a *App) RegisterRoutes(s *ghttp.Server) {
 		g.Middleware(ghttp.MiddlewareCORS)
 		g.GET("/", a.RenderLoginPage)
 		g.GET("/portal", a.RenderPortalPage) // HTML
-		g.GET("/sync/webtops", a.HandleSyncWebtops)
 		g.POST("/login", a.HandleLogin)
 		g.POST("/logout", a.HandleLogout)
 		g.GET("/auth/check", a.HandleAuthCheck)
@@ -64,6 +75,7 @@ func (a *App) RegisterRoutes(s *ghttp.Server) {
 					admin.GET("/webtops", a.AdminListWebtops)
 					admin.POST("/webtops", a.AdminCreateWebtop)
 					admin.POST("/webtops/{id}", a.AdminUpdateWebtop)
+					admin.DELETE("/webtops/{id}", a.AdminDeleteWebtop)
 				})
 			}
 		})
@@ -202,20 +214,6 @@ func (a *App) HandlePortal(r *ghttp.Request) {
 	})
 }
 
-// HandleSyncWebtops returns all webtops for sync, guarded by X-Sync-Secret (no session required).
-func (a *App) HandleSyncWebtops(r *ghttp.Request) {
-	if syncSecret == "" || r.Header.Get("X-Sync-Secret") != syncSecret {
-		r.Response.WriteStatus(http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	list, err := a.store.ListWebtops()
-	if err != nil {
-		r.Response.WriteStatus(http.StatusInternalServerError, "internal error")
-		return
-	}
-	r.Response.WriteJson(list)
-}
-
 // ----- Admin APIs -----
 
 func (a *App) AdminListUsers(r *ghttp.Request) {
@@ -351,6 +349,19 @@ func (a *App) AdminUpdateWebtop(r *ghttp.Request) {
 	r.Response.WriteJson(map[string]string{"status": "ok"})
 }
 
+func (a *App) AdminDeleteWebtop(r *ghttp.Request) {
+	id, _ := strconv.ParseInt(r.Get("id").String(), 10, 64)
+	if id == 0 {
+		r.Response.WriteStatus(http.StatusBadRequest, "bad webtop id")
+		return
+	}
+	if err := a.store.DeleteWebtop(id); err != nil {
+		r.Response.WriteStatus(http.StatusInternalServerError, "failed")
+		return
+	}
+	r.Response.WriteJson(map[string]string{"status": "ok"})
+}
+
 // When user hits /webtop/{path:*} without id, pick first accessible webtop
 func (a *App) HandleWebtopDefaultProxy(r *ghttp.Request) {
 	_, ok := r.GetCtxVar("user").Interface().(User)
@@ -364,8 +375,23 @@ func (a *App) HandleWebtopDefaultProxy(r *ghttp.Request) {
 func (a *App) serveReverseProxy(r *ghttp.Request, target *url.URL) {
 	path := r.Request.URL.Path
 	joinedPath := joinURLPath(target.Path, path)
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	if target.Scheme == "https" {
+	upstream := target
+	if a.cfg.TunnelEnabled {
+		clone := *target
+		clone.Scheme = "http" // avoid TLS over tunnel; real TLS handled by client when dialing targetURL
+		upstream = &clone
+	}
+	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	transport := &http.Transport{}
+	if a.cfg.TunnelEnabled {
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return DialTunnel(ctx, a.tunnel, a.cfg.Tunnel, target.String())
+		}
+		transport.DisableKeepAlives = true
+	}
+	// Only terminate TLS here when we are dialing the upstream directly.
+	// In tunnel mode，client 会直连目标并处理 TLS。
+	if target.Scheme == "https" && !a.cfg.TunnelEnabled {
 		tlsCfg := &tls.Config{}
 		if proxyInsecureTLS {
 			tlsCfg.InsecureSkipVerify = true // intended for self-signed upstream
@@ -381,16 +407,71 @@ func (a *App) serveReverseProxy(r *ghttp.Request, target *url.URL) {
 				log.Printf("load proxy ca file error: %v", err)
 			}
 		}
-		proxy.Transport = &http.Transport{
-			TLSClientConfig: tlsCfg,
-		}
+		transport.TLSClientConfig = tlsCfg
+	}
+	if transport.DialContext != nil || transport.TLSClientConfig != nil {
+		proxy.Transport = transport
 	}
 	proxy.Director = func(req *http.Request) {
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.Host = target.Host
+		req.URL.Scheme = upstream.Scheme
+		req.URL.Host = upstream.Host
+		req.Host = upstream.Host
 		req.URL.Path = joinedPath
 		req.URL.RawPath = ""
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		ct := resp.Header.Get("Content-Type")
+		if resp.StatusCode != http.StatusOK || !strings.Contains(ct, "text/html") {
+			return nil
+		}
+		// Best-effort check; do not block to avoid false positives.
+		const maxCheck = 2 * 1024 * 1024 // 2MB cap to avoid huge bodies
+		reader := resp.Body
+		encoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
+		decompressed := false
+		if strings.Contains(encoding, "gzip") {
+			if gz, err := gzip.NewReader(resp.Body); err == nil {
+				reader = gz
+				defer gz.Close()
+				decompressed = true
+			} else {
+				log.Printf("warning: gzip decode failed, skip html check: %v", err)
+				return nil
+			}
+		} else if strings.Contains(encoding, "deflate") {
+			if fr := flate.NewReader(resp.Body); fr != nil {
+				reader = fr
+				defer fr.Close()
+				decompressed = true
+			} else {
+				log.Printf("warning: deflate decode failed, skip html check")
+				return nil
+			}
+		}
+		body, err := io.ReadAll(io.LimitReader(reader, maxCheck))
+		if err != nil {
+			return err
+		}
+		_ = resp.Body.Close()
+		lc := bytes.ToLower(body)
+		hasApp := bytes.Contains(lc, []byte(`<div id="app"`))
+		hasRoot := bytes.Contains(lc, []byte(`<div id="root"`))
+		hasTouch := bytes.Contains(lc, []byte(`<div id="touch-gamepad-host"`))
+		if !(hasApp && hasRoot && hasTouch) {
+			resp.StatusCode = http.StatusForbidden
+			resp.Status = http.StatusText(http.StatusForbidden)
+			resp.Header.Del("Content-Length")
+			resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
+			resp.Body = io.NopCloser(strings.NewReader("forbidden: not a recognized webtop page"))
+			return nil
+		}
+		resp.Body = io.NopCloser(bytes.NewBuffer(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		if decompressed {
+			resp.Header.Del("Content-Encoding")
+		}
+		return nil
 	}
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		log.Printf("proxy error: %v", err)
@@ -454,18 +535,23 @@ func (a *App) HandleWebtopProxy(r *ghttp.Request) {
 		r.Response.WriteStatus(http.StatusInternalServerError, "internal error")
 		return
 	}
-	target, err := url.Parse(webtop.TargetURL)
+	targetURL := strings.ReplaceAll(webtop.TargetURL, "{id}", idStr)
+	target, err := url.Parse(targetURL)
 	if err != nil {
 		r.Response.WriteStatus(http.StatusInternalServerError, "invalid target")
 		return
 	}
-	// strip prefix /webtop/{id} from the incoming path for upstream
 	inPath := r.Request.URL.Path
-	r.Request.URL.Path = strings.TrimPrefix(inPath, "/webtop/"+idStr)
-	if r.Request.URL.Path == "" {
-		r.Request.URL.Path = "/"
+	if strings.Contains(target.Path, "/webtop/") {
+		r.Request.URL.Path = inPath
+		r.Request.URL.RawPath = inPath
+	} else {
+		r.Request.URL.Path = strings.TrimPrefix(inPath, "/webtop/"+idStr)
+		if r.Request.URL.Path == "" {
+			r.Request.URL.Path = "/"
+		}
+		r.Request.URL.RawPath = r.Request.URL.Path
 	}
-	r.Request.URL.RawPath = r.Request.URL.Path
 	a.serveReverseProxy(r, target)
 }
 
@@ -486,21 +572,21 @@ func (a *App) AdminMiddleware(r *ghttp.Request) {
 		r.Response.WriteStatus(http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	// Allow either header secret (if configured) or admin role.
 	if adminSecret != "" {
-		if sec := r.Header.Get("X-Admin-Secret"); sec != adminSecret {
-			r.Response.WriteStatus(http.StatusForbidden, "forbidden")
+		if sec := r.Header.Get("X-Admin-Secret"); sec == adminSecret {
+			r.Middleware.Next()
 			return
 		}
-	} else {
-		okRole, err := a.store.HasRole(user.ID, defaultAdminRole)
-		if err != nil {
-			r.Response.WriteStatus(http.StatusInternalServerError, "internal error")
-			return
-		}
-		if !okRole {
-			r.Response.WriteStatus(http.StatusForbidden, "forbidden")
-			return
-		}
+	}
+	okRole, err := a.store.HasRole(user.ID, defaultAdminRole)
+	if err != nil {
+		r.Response.WriteStatus(http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !okRole {
+		r.Response.WriteStatus(http.StatusForbidden, "forbidden")
+		return
 	}
 	r.Middleware.Next()
 }

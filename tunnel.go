@@ -2,334 +2,312 @@ package app
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"os"
-	"strconv"
+	"net/url"
 	"strings"
-	"sync"
 	"time"
 )
 
+const (
+	tunnelMagic    = "TUNL"
+	maxTunnelField = 4096
+)
+
 type TunnelConfig struct {
-	ServerAddr   string // server host:port (control + data share host)
-	ControlPort  int    // control channel port
-	DataPort     int    // data channel port
-	PublicPort   int    // server listening port to expose
-	LocalTarget  string // client local target (ip:port)
-	Secret       string // pre-shared secret
-	ReconnectSec int
+	ServerAddr  string
+	DataPort    int
+	Secret      string
+	TLSEnabled  bool
+	TLSCert     string
+	TLSKey      string
+	TLSInsecure bool
+	ConnCount   int
 }
 
 func loadTunnelConfig() TunnelConfig {
 	return TunnelConfig{
-		ServerAddr:   envOr("TUNNEL_SERVER_ADDR", "127.0.0.1"),
-		ControlPort:  envInt("TUNNEL_CTRL_PORT", 9100),
-		DataPort:     envInt("TUNNEL_DATA_PORT", 9101),
-		PublicPort:   envInt("TUNNEL_PUBLIC_PORT", 10080),
-		LocalTarget:  envOr("TUNNEL_LOCAL_TARGET", "127.0.0.1:8080"),
-		Secret:       envOr("TUNNEL_SECRET", "changeme"),
-		ReconnectSec: envInt("TUNNEL_RECONNECT_SEC", 5),
+		ServerAddr:  envOr("TUNNEL_SERVER_ADDR", "127.0.0.1"),
+		DataPort:    envInt("TUNNEL_DATA_PORT", 9101),
+		Secret:      envOr("TUNNEL_SECRET", "change-me-tunnel-secret"),
+		TLSEnabled:  strings.EqualFold(envOr("TUNNEL_TLS_ENABLED", "false"), "true"),
+		TLSCert:     envOr("TUNNEL_TLS_CERT", ""),
+		TLSKey:      envOr("TUNNEL_TLS_KEY", ""),
+		TLSInsecure: strings.EqualFold(envOr("TUNNEL_TLS_INSECURE", "false"), "true"),
+		ConnCount:   envInt("TUNNEL_CONN_COUNT", 4),
 	}
 }
 
-// ================= Tunnel Server =================
-
+// TunnelServer accepts inbound tunnel connections (from client) and hands them out per request.
 type TunnelServer struct {
-	Cfg      TunnelConfig
-	ctrlConn net.Conn
-	mu       sync.Mutex
+	cfg    TunnelConfig
+	ln     net.Listener
+	connCh chan net.Conn
 }
 
-func (ts *TunnelServer) Start(ctx context.Context) error {
-	go ts.listenControl(ctx)
-	go ts.listenData(ctx) // noop but keep port reserved
-	go ts.listenPublic(ctx)
-	return nil
-}
-
-func (ts *TunnelServer) listenControl(ctx context.Context) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ts.Cfg.ControlPort))
-	if err != nil {
-		log.Printf("tunnel control listen error: %v", err)
-		return
+// StartTunnelServer listens on cfg.ServerAddr:cfg.DataPort and verifies secrets.
+func StartTunnelServer(ctx context.Context, cfg TunnelConfig) (*TunnelServer, error) {
+	addr := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.DataPort)
+	var ln net.Listener
+	var err error
+	if cfg.TLSEnabled {
+		if cfg.TLSCert == "" || cfg.TLSKey == "" {
+			return nil, errors.New("tunnel tls enabled but cert/key not provided")
+		}
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			return nil, fmt.Errorf("load tunnel cert: %w", err)
+		}
+		ln, err = tls.Listen("tcp", addr, &tls.Config{Certificates: []tls.Certificate{cert}})
+	} else {
+		ln, err = net.Listen("tcp", addr)
 	}
-	log.Printf("tunnel control listening on :%d", ts.Cfg.ControlPort)
+	if err != nil {
+		return nil, err
+	}
+	ts := &TunnelServer{
+		cfg:    cfg,
+		ln:     ln,
+		connCh: make(chan net.Conn, 32),
+	}
+	go ts.acceptLoop(ctx)
+	return ts, nil
+}
+
+func (t *TunnelServer) acceptLoop(ctx context.Context) {
+	log.Printf("tunnel server listening on %s", t.ln.Addr().String())
 	for {
-		conn, err := ln.Accept()
+		conn, err := t.ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("control accept error: %v", err)
+			log.Printf("tunnel accept error: %v", err)
 			continue
 		}
-		if !ts.verifyAuth(conn) {
+		go func(c net.Conn) {
+			if err := verifyMagicAndSecret(c, t.cfg.Secret); err != nil {
+				log.Printf("tunnel auth error: %v", err)
+				c.Close()
+				return
+			}
+			select {
+			case t.connCh <- c:
+			default:
+				log.Printf("tunnel backlog full, closing connection")
+				c.Close()
+			}
+		}(conn)
+	}
+}
+
+// GetConn blocks until a client-provided tunnel connection is available or ctx is done.
+func (t *TunnelServer) GetConn(ctx context.Context) (net.Conn, error) {
+	select {
+	case c := <-t.connCh:
+		return c, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(5 * time.Second):
+		return nil, errors.New("no tunnel connection available")
+	}
+}
+
+// Client side: dial server, authenticate, wait for target instruction, then proxy.
+func StartTunnelClient(ctx context.Context, cfg TunnelConfig) error {
+	serverAddr := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.DataPort)
+	workers := cfg.ConnCount
+	if workers < 1 {
+		workers = 1
+	}
+	for i := 0; i < workers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				var conn net.Conn
+				var err error
+				if cfg.TLSEnabled {
+					tlsCfg := &tls.Config{InsecureSkipVerify: cfg.TLSInsecure}
+					conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", serverAddr, tlsCfg)
+				} else {
+					dialer := net.Dialer{Timeout: 5 * time.Second}
+					conn, err = dialer.DialContext(ctx, "tcp", serverAddr)
+				}
+				if err != nil {
+					log.Printf("tunnel connect error: %v", err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				if err := writeMagicAndSecret(conn, cfg.Secret); err != nil {
+					log.Printf("tunnel auth send error: %v", err)
+					conn.Close()
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				handleTunnelConn(conn, cfg)
+			}
+		}()
+	}
+	<-ctx.Done()
+	return nil
+}
+
+// Server side dialer when a TunnelServer is available; falls back to direct dial if ts is nil.
+func DialTunnel(ctx context.Context, ts *TunnelServer, cfg TunnelConfig, targetURL string) (net.Conn, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		if ts != nil {
+			conn, err := ts.GetConn(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if err := writeString(conn, targetURL); err != nil {
+				log.Printf("tunnel write target error: %v", err)
+				conn.Close()
+				continue
+			}
+			return conn, nil
+		}
+		// fallback: direct dial (non-NAT)
+		addr := fmt.Sprintf("%s:%d", cfg.ServerAddr, cfg.DataPort)
+		var conn net.Conn
+		var err error
+		if cfg.TLSEnabled {
+			tlsCfg := &tls.Config{InsecureSkipVerify: cfg.TLSInsecure}
+			conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, tlsCfg)
+		} else {
+			dialer := net.Dialer{Timeout: 5 * time.Second}
+			conn, err = dialer.DialContext(ctx, "tcp", addr)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err := writeMagicAndSecret(conn, cfg.Secret); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if err := writeString(conn, targetURL); err != nil {
+			log.Printf("tunnel write target error: %v", err)
 			conn.Close()
 			continue
 		}
-		ts.mu.Lock()
-		if ts.ctrlConn != nil {
-			ts.ctrlConn.Close()
-		}
-		ts.ctrlConn = conn
-		ts.mu.Unlock()
-		log.Printf("tunnel control connected from %s", conn.RemoteAddr())
+		return conn, nil
 	}
+	return nil, errors.New("no tunnel connection available")
 }
 
-func (ts *TunnelServer) listenData(ctx context.Context) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ts.Cfg.DataPort))
+func handleTunnelConn(c net.Conn, cfg TunnelConfig) {
+	defer c.Close()
+	targetURL, err := readString(c)
 	if err != nil {
-		log.Printf("tunnel data listen error: %v", err)
+		log.Printf("tunnel read target error: %v", err)
 		return
 	}
-	log.Printf("tunnel data listening on :%d", ts.Cfg.DataPort)
-	for {
-		_, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("data accept error (ignored): %v", err)
-		}
-	}
-}
-
-func (ts *TunnelServer) listenPublic(ctx context.Context) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ts.Cfg.PublicPort))
+	log.Printf("tunnel recv target=%s from %s", targetURL, c.RemoteAddr())
+	u, err := url.Parse(targetURL)
 	if err != nil {
-		log.Printf("public listen error: %v", err)
+		log.Printf("tunnel parse target error: %v", err)
 		return
 	}
-	log.Printf("public exposed port on :%d -> client target %s", ts.Cfg.PublicPort, ts.Cfg.LocalTarget)
-	for {
-		pubConn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("public accept error: %v", err)
-			continue
-		}
-		go ts.handlePublic(ctx, pubConn)
-	}
-}
-
-func (ts *TunnelServer) handlePublic(ctx context.Context, pubConn net.Conn) {
-	ts.mu.Lock()
-	ctrl := ts.ctrlConn
-	ts.mu.Unlock()
-	if ctrl == nil {
-		log.Printf("no client connected, dropping public conn from %s", pubConn.RemoteAddr())
-		pubConn.Close()
-		return
-	}
-	// ask client to dial data channel and local target
-	if _, err := ctrl.Write([]byte{0x01}); err != nil {
-		log.Printf("control write error: %v", err)
-		pubConn.Close()
-		return
-	}
-
-	dataConn, err := waitDataConn(ctx, ts.Cfg)
+	targetConn, err := dialTarget(u)
 	if err != nil {
-		log.Printf("wait data conn error: %v", err)
-		pubConn.Close()
+		log.Printf("tunnel dial target error: %v", err)
 		return
 	}
-	defer dataConn.Close()
-
-	if !ts.verifyAuth(dataConn) {
-		pubConn.Close()
-		return
-	}
-	if err := pipeEncrypted(pubConn, dataConn, ts.Cfg.Secret); err != nil {
-		log.Printf("pipe error: %v", err)
-	}
+	log.Printf("tunnel connected target=%s", u.String())
+	defer targetConn.Close()
+	pipeConn(c, targetConn)
 }
 
-func waitDataConn(ctx context.Context, cfg TunnelConfig) (net.Conn, error) {
-	d := net.Dialer{Timeout: 10 * time.Second}
-	for {
-		conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf(":%d", cfg.DataPort))
-		if err == nil {
-			return conn, nil
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
-}
-
-// ================= Tunnel Client =================
-
-type TunnelClient struct {
-	Cfg TunnelConfig
-}
-
-func (tc *TunnelClient) Start(ctx context.Context) error {
-	go tc.controlLoop(ctx)
-	return nil
-}
-
-func (tc *TunnelClient) controlLoop(ctx context.Context) {
-	for {
-		if err := tc.runOnce(ctx); err != nil {
-			log.Printf("tunnel client run error: %v", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(time.Duration(tc.Cfg.ReconnectSec) * time.Second):
-		}
-	}
-}
-
-func (tc *TunnelClient) runOnce(ctx context.Context) error {
-	addr := fmt.Sprintf("%s:%d", tc.Cfg.ServerAddr, tc.Cfg.ControlPort)
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
+func writeMagicAndSecret(w io.Writer, secret string) error {
+	if _, err := w.Write([]byte(tunnelMagic)); err != nil {
 		return err
 	}
-	if !sendAuth(conn, tc.Cfg.Secret) {
-		conn.Close()
-		return errors.New("auth failed")
-	}
-	log.Printf("tunnel client connected to control %s", addr)
-	buf := make([]byte, 1)
-	for {
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			return err
-		}
-		if buf[0] == 0x01 {
-			go tc.spawnDataChannel(ctx)
-		}
-	}
-}
-
-func (tc *TunnelClient) spawnDataChannel(ctx context.Context) {
-	dataAddr := fmt.Sprintf("%s:%d", tc.Cfg.ServerAddr, tc.Cfg.DataPort)
-	dconn, err := net.Dial("tcp", dataAddr)
-	if err != nil {
-		log.Printf("data dial error: %v", err)
-		return
-	}
-	if !sendAuth(dconn, tc.Cfg.Secret) {
-		dconn.Close()
-		return
-	}
-	localConn, err := net.Dial("tcp", tc.Cfg.LocalTarget)
-	if err != nil {
-		log.Printf("local dial error: %v", err)
-		dconn.Close()
-		return
-	}
-	defer localConn.Close()
-	if err := pipeEncrypted(localConn, dconn, tc.Cfg.Secret); err != nil {
-		log.Printf("pipe error: %v", err)
-	}
-}
-
-// ================= helpers =================
-
-func sendAuth(conn net.Conn, secret string) bool {
-	hash := sha256.Sum256([]byte(secret))
-	if _, err := conn.Write(hash[:]); err != nil {
-		return false
-	}
-	return true
-}
-
-func (ts *TunnelServer) verifyAuth(conn net.Conn) bool {
-	expected := sha256.Sum256([]byte(ts.Cfg.Secret))
-	var got [32]byte
-	if _, err := io.ReadFull(conn, got[:]); err != nil {
-		log.Printf("auth read error: %v", err)
-		return false
-	}
-	if got != expected {
-		log.Printf("auth failed from %s", conn.RemoteAddr())
-		return false
-	}
-	return true
-}
-
-func deriveKey(secret string) []byte {
 	sum := sha256.Sum256([]byte(secret))
-	return sum[:]
+	_, err := w.Write(sum[:])
+	return err
 }
 
-func pipeEncrypted(a, b net.Conn, secret string) error {
-	key := deriveKey(secret)
-
-	aesBlock, err := aes.NewCipher(key)
-	if err != nil {
+func verifyMagicAndSecret(r io.Reader, secret string) error {
+	magic := make([]byte, len(tunnelMagic))
+	if _, err := io.ReadFull(r, magic); err != nil {
 		return err
 	}
-	// IV for both directions; simple CTR
-	ivA := make([]byte, aes.BlockSize)
-	ivB := make([]byte, aes.BlockSize)
-	if _, err := rand.Read(ivA); err != nil {
+	if string(magic) != tunnelMagic {
+		return errors.New("bad magic")
+	}
+	var recv [32]byte
+	if _, err := io.ReadFull(r, recv[:]); err != nil {
 		return err
 	}
-	if _, err := rand.Read(ivB); err != nil {
-		return err
-	}
-	if _, err := b.Write(ivA); err != nil {
-		return err
-	}
-	if _, err := b.Write(ivB); err != nil {
-		return err
-	}
-
-	streamA := cipher.NewCTR(aesBlock, ivA)
-	streamB := cipher.NewCTR(aesBlock, ivB)
-
-	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(cipher.StreamWriter{S: streamA, W: b}, a)
-		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(a, cipher.StreamReader{S: streamB, R: b})
-		errCh <- err
-	}()
-	err1 := <-errCh
-	err2 := <-errCh
-	if err1 != nil && !errors.Is(err1, net.ErrClosed) {
-		return err1
-	}
-	if err2 != nil && !errors.Is(err2, net.ErrClosed) {
-		return err2
+	if sha256.Sum256([]byte(secret)) != recv {
+		return errors.New("bad secret")
 	}
 	return nil
 }
 
-func envOr(key, def string) string {
-	v := strings.TrimSpace(strings.Trim(os.Getenv(key), " "))
-	if v == "" {
-		return def
+func writeString(w io.Writer, s string) error {
+	if len(s) > maxTunnelField {
+		return fmt.Errorf("field too long")
 	}
-	return v
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(s)))
+	if _, err := w.Write(lenBuf[:]); err != nil {
+		return err
+	}
+	_, err := w.Write([]byte(s))
+	return err
 }
 
-func envInt(key string, def int) int {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
+func readString(r io.Reader) (string, error) {
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return "", err
 	}
-	if n, err := strconv.Atoi(v); err == nil {
-		return n
+	n := binary.BigEndian.Uint16(lenBuf[:])
+	if n > maxTunnelField {
+		return "", errors.New("field too long")
 	}
-	return def
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+func dialTarget(u *url.URL) (net.Conn, error) {
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		if u.Scheme == "https" {
+			host += ":443"
+		} else {
+			host += ":80"
+		}
+	}
+	if u.Scheme == "https" {
+		return tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", host, &tls.Config{InsecureSkipVerify: true})
+	}
+	return net.DialTimeout("tcp", host, 5*time.Second)
+}
+
+func pipeConn(a, b net.Conn) {
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(a, b)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(b, a)
+		done <- struct{}{}
+	}()
+	<-done
 }

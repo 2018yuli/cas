@@ -99,7 +99,10 @@
             <td><input data-wid="${w.id}" data-field="name" value="${w.name}" style="width:100px;"></td>
             <td><input data-wid="${w.id}" data-field="url" value="${w.target_url}" style="width:240px;"></td>
             <td><input type="checkbox" data-wid="${w.id}" data-field="enabled" ${w.enabled ? 'checked' : ''}></td>
-            <td><button data-action="savewt" data-id="${w.id}">保存</button></td>
+            <td class="row">
+              <button data-action="savewt" data-id="${w.id}">保存</button>
+              <button class="danger" data-action="delwt" data-id="${w.id}">删除</button>
+            </td>
           `;
           tbody.appendChild(tr);
         });
@@ -185,14 +188,18 @@
       const msg = document.getElementById('wtMsg');
       msg.textContent = '';
       try {
-        const name = document.querySelector(`input[data-wid="${id}"][data-field="name"]`).value;
-        const url = document.querySelector(`input[data-wid="${id}"][data-field="url"]`).value;
-        const enabled = document.querySelector(`input[data-wid="${id}"][data-field="enabled"]`).checked;
-        await fetchJSON(`/admin/webtops/${id}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, target_url: url, enabled })
-        });
+        if (btn.dataset.action === 'delwt') {
+          await fetchJSON(`/admin/webtops/${id}`, { method: 'DELETE' });
+        } else {
+          const name = document.querySelector(`input[data-wid="${id}"][data-field="name"]`).value;
+          const url = document.querySelector(`input[data-wid="${id}"][data-field="url"]`).value;
+          const enabled = document.querySelector(`input[data-wid="${id}"][data-field="enabled"]`).checked;
+          await fetchJSON(`/admin/webtops/${id}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, target_url: url, enabled })
+          });
+        }
         await loadWebtops();
       } catch (e) {
         msg.textContent = e.message;

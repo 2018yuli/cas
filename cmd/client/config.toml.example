@@ -1,0 +1,18 @@
+db_path = "data/user-center.db"
+port = 8090
+https_port = 8443
+tls_cert = ""
+tls_key = ""
+
+[admin]
+enabled = true
+secret = "" # empty => role-based admin check; set value to enforce header X-Admin-Secret
+
+[tunnel]
+enabled = true
+server_addr = "server.example.com" # server 公网地址/域名
+data_port = 9101                  # server 监听的隧道端口
+secret = "change-me-tunnel-secret"
+tls_enabled = false
+tls_insecure = true
+conn_count = 4

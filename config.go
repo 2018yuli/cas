@@ -29,7 +29,6 @@ var (
 	proxyInsecureTLS = true // 默认关闭上游 TLS 校验，便于自签 Webtop
 	proxyCAFile      = ""
 	adminSecret      = ""
-	syncSecret       = ""
 )
 
 type Config struct {
@@ -40,10 +39,6 @@ type Config struct {
 	TLSKey        string
 	AdminEnabled  bool
 	AdminSecret   string
-	SyncEnabled   bool
-	SyncURL       string
-	SyncSecret    string
-	SyncInterval  time.Duration
 	TunnelEnabled bool
 	Tunnel        TunnelConfig
 	TOMLPath      string
@@ -54,22 +49,16 @@ type AdminSection struct {
 	Secret  string `toml:"secret"`
 }
 
-type SyncSection struct {
-	Enabled  bool   `toml:"enabled"`
-	URL      string `toml:"url"`
-	Secret   string `toml:"secret"`
-	Interval int    `toml:"interval_sec"` // seconds
-}
-
 type TunnelSection struct {
-	Enabled      bool   `toml:"enabled"`
-	ServerAddr   string `toml:"server_addr"`
-	ControlPort  int    `toml:"control_port"`
-	DataPort     int    `toml:"data_port"`
-	PublicPort   int    `toml:"public_port"`
-	LocalTarget  string `toml:"local_target"`
-	Secret       string `toml:"secret"`
-	ReconnectSec int    `toml:"reconnect_sec"`
+	Enabled     bool   `toml:"enabled"`
+	ServerAddr  string `toml:"server_addr"`
+	DataPort    int    `toml:"data_port"`
+	Secret      string `toml:"secret"`
+	TLSEnabled  bool   `toml:"tls_enabled"`
+	TLSCert     string `toml:"tls_cert"`
+	TLSKey      string `toml:"tls_key"`
+	TLSInsecure bool   `toml:"tls_insecure"`
+	ConnCount   int    `toml:"conn_count"`
 }
 
 func (t TunnelSection) ToConfig() TunnelConfig {
@@ -77,23 +66,26 @@ func (t TunnelSection) ToConfig() TunnelConfig {
 	if t.ServerAddr != "" {
 		cfg.ServerAddr = t.ServerAddr
 	}
-	if t.ControlPort > 0 {
-		cfg.ControlPort = t.ControlPort
-	}
 	if t.DataPort > 0 {
 		cfg.DataPort = t.DataPort
-	}
-	if t.PublicPort > 0 {
-		cfg.PublicPort = t.PublicPort
-	}
-	if t.LocalTarget != "" {
-		cfg.LocalTarget = t.LocalTarget
 	}
 	if t.Secret != "" {
 		cfg.Secret = t.Secret
 	}
-	if t.ReconnectSec > 0 {
-		cfg.ReconnectSec = t.ReconnectSec
+	if t.TLSEnabled {
+		cfg.TLSEnabled = true
+	}
+	if t.TLSCert != "" {
+		cfg.TLSCert = t.TLSCert
+	}
+	if t.TLSKey != "" {
+		cfg.TLSKey = t.TLSKey
+	}
+	if t.TLSInsecure {
+		cfg.TLSInsecure = true
+	}
+	if t.ConnCount > 0 {
+		cfg.ConnCount = t.ConnCount
 	}
 	return cfg
 }
@@ -114,7 +106,6 @@ func LoadConfig() Config {
 			TLSCert   string        `toml:"tls_cert"`
 			TLSKey    string        `toml:"tls_key"`
 			Admin     AdminSection  `toml:"admin"`
-			Sync      SyncSection   `toml:"sync"`
 			Tunnel    TunnelSection `toml:"tunnel"`
 		}
 		if _, err := toml.DecodeFile(cfg.TOMLPath, &fileCfg); err == nil {
@@ -134,18 +125,6 @@ func LoadConfig() Config {
 			cfg.AdminEnabled = fileCfg.Admin.Enabled
 			if fileCfg.Admin.Secret != "" {
 				cfg.AdminSecret = fileCfg.Admin.Secret
-				adminSecret = cfg.AdminSecret
-			}
-			cfg.SyncEnabled = fileCfg.Sync.Enabled
-			if fileCfg.Sync.URL != "" {
-				cfg.SyncURL = fileCfg.Sync.URL
-			}
-			if fileCfg.Sync.Secret != "" {
-				cfg.SyncSecret = fileCfg.Sync.Secret
-				syncSecret = cfg.SyncSecret
-			}
-			if fileCfg.Sync.Interval > 0 {
-				cfg.SyncInterval = time.Duration(fileCfg.Sync.Interval) * time.Second
 			}
 			cfg.TunnelEnabled = fileCfg.Tunnel.Enabled
 			cfg.Tunnel = fileCfg.Tunnel.ToConfig()
@@ -153,6 +132,7 @@ func LoadConfig() Config {
 			log.Printf("failed to parse %s: %v", cfg.TOMLPath, err)
 		}
 	}
+	adminSecret = cfg.AdminSecret
 	return cfg
 }
 
@@ -170,14 +150,6 @@ func loadFromEnv() Config {
 		adminEnabled = false
 	}
 	adminSecret = strings.TrimSpace(os.Getenv("ADMIN_SECRET"))
-	syncSecret = strings.TrimSpace(os.Getenv("SYNC_SECRET"))
-
-	syncEnabled := false
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv("SYNC_ENABLED"))); v == "1" || v == "true" || v == "yes" {
-		syncEnabled = true
-	}
-	syncURL := strings.TrimSpace(os.Getenv("SYNC_URL"))
-	syncInterval := envInt("SYNC_INTERVAL_SEC", 300)
 
 	tunnelEnabled := false
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("TUNNEL_ENABLED"))); v == "1" || v == "true" || v == "yes" {
@@ -192,13 +164,25 @@ func loadFromEnv() Config {
 		TLSKey:        tlsKey,
 		AdminEnabled:  adminEnabled,
 		AdminSecret:   adminSecret,
-		SyncEnabled:   syncEnabled,
-		SyncURL:       syncURL,
-		SyncSecret:    syncSecret,
-		SyncInterval:  time.Duration(syncInterval) * time.Second,
 		TunnelEnabled: tunnelEnabled,
 		Tunnel:        loadTunnelConfig(),
 	}
+}
+
+func envOr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 func init() {

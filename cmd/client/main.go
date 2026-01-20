@@ -18,10 +18,13 @@ func main() {
 	}
 
 	if cfg.TunnelEnabled {
-		tc := &core.TunnelClient{Cfg: cfg.Tunnel}
-		_ = tc.Start(context.Background())
+		go func() {
+			if err := core.StartTunnelClient(context.Background(), cfg.Tunnel); err != nil {
+				log.Fatalf("start tunnel client: %v", err)
+			}
+		}()
 	}
 
-	app := core.NewApp(store)
+	app := core.NewApp(store, cfg)
 	core.RunClient(cfg, app)
 }
