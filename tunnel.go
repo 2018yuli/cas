@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -11,6 +11,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +43,7 @@ func loadTunnelConfig() TunnelConfig {
 // ================= Tunnel Server =================
 
 type TunnelServer struct {
-	cfg      TunnelConfig
+	Cfg      TunnelConfig
 	ctrlConn net.Conn
 	mu       sync.Mutex
 }
@@ -54,12 +56,12 @@ func (ts *TunnelServer) Start(ctx context.Context) error {
 }
 
 func (ts *TunnelServer) listenControl(ctx context.Context) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ts.cfg.ControlPort))
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ts.Cfg.ControlPort))
 	if err != nil {
 		log.Printf("tunnel control listen error: %v", err)
 		return
 	}
-	log.Printf("tunnel control listening on :%d", ts.cfg.ControlPort)
+	log.Printf("tunnel control listening on :%d", ts.Cfg.ControlPort)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -84,12 +86,12 @@ func (ts *TunnelServer) listenControl(ctx context.Context) {
 }
 
 func (ts *TunnelServer) listenData(ctx context.Context) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ts.cfg.DataPort))
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ts.Cfg.DataPort))
 	if err != nil {
 		log.Printf("tunnel data listen error: %v", err)
 		return
 	}
-	log.Printf("tunnel data listening on :%d", ts.cfg.DataPort)
+	log.Printf("tunnel data listening on :%d", ts.Cfg.DataPort)
 	for {
 		_, err := ln.Accept()
 		if err != nil {
@@ -102,12 +104,12 @@ func (ts *TunnelServer) listenData(ctx context.Context) {
 }
 
 func (ts *TunnelServer) listenPublic(ctx context.Context) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ts.cfg.PublicPort))
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ts.Cfg.PublicPort))
 	if err != nil {
 		log.Printf("public listen error: %v", err)
 		return
 	}
-	log.Printf("public exposed port on :%d -> client target %s", ts.cfg.PublicPort, ts.cfg.LocalTarget)
+	log.Printf("public exposed port on :%d -> client target %s", ts.Cfg.PublicPort, ts.Cfg.LocalTarget)
 	for {
 		pubConn, err := ln.Accept()
 		if err != nil {
@@ -137,7 +139,7 @@ func (ts *TunnelServer) handlePublic(ctx context.Context, pubConn net.Conn) {
 		return
 	}
 
-	dataConn, err := waitDataConn(ctx, ts.cfg)
+	dataConn, err := waitDataConn(ctx, ts.Cfg)
 	if err != nil {
 		log.Printf("wait data conn error: %v", err)
 		pubConn.Close()
@@ -149,7 +151,7 @@ func (ts *TunnelServer) handlePublic(ctx context.Context, pubConn net.Conn) {
 		pubConn.Close()
 		return
 	}
-	if err := pipeEncrypted(pubConn, dataConn, ts.cfg.Secret); err != nil {
+	if err := pipeEncrypted(pubConn, dataConn, ts.Cfg.Secret); err != nil {
 		log.Printf("pipe error: %v", err)
 	}
 }
@@ -172,7 +174,7 @@ func waitDataConn(ctx context.Context, cfg TunnelConfig) (net.Conn, error) {
 // ================= Tunnel Client =================
 
 type TunnelClient struct {
-	cfg TunnelConfig
+	Cfg TunnelConfig
 }
 
 func (tc *TunnelClient) Start(ctx context.Context) error {
@@ -188,18 +190,18 @@ func (tc *TunnelClient) controlLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(time.Duration(tc.cfg.ReconnectSec) * time.Second):
+		case <-time.After(time.Duration(tc.Cfg.ReconnectSec) * time.Second):
 		}
 	}
 }
 
 func (tc *TunnelClient) runOnce(ctx context.Context) error {
-	addr := fmt.Sprintf("%s:%d", tc.cfg.ServerAddr, tc.cfg.ControlPort)
+	addr := fmt.Sprintf("%s:%d", tc.Cfg.ServerAddr, tc.Cfg.ControlPort)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return err
 	}
-	if !sendAuth(conn, tc.cfg.Secret) {
+	if !sendAuth(conn, tc.Cfg.Secret) {
 		conn.Close()
 		return errors.New("auth failed")
 	}
@@ -216,24 +218,24 @@ func (tc *TunnelClient) runOnce(ctx context.Context) error {
 }
 
 func (tc *TunnelClient) spawnDataChannel(ctx context.Context) {
-	dataAddr := fmt.Sprintf("%s:%d", tc.cfg.ServerAddr, tc.cfg.DataPort)
+	dataAddr := fmt.Sprintf("%s:%d", tc.Cfg.ServerAddr, tc.Cfg.DataPort)
 	dconn, err := net.Dial("tcp", dataAddr)
 	if err != nil {
 		log.Printf("data dial error: %v", err)
 		return
 	}
-	if !sendAuth(dconn, tc.cfg.Secret) {
+	if !sendAuth(dconn, tc.Cfg.Secret) {
 		dconn.Close()
 		return
 	}
-	localConn, err := net.Dial("tcp", tc.cfg.LocalTarget)
+	localConn, err := net.Dial("tcp", tc.Cfg.LocalTarget)
 	if err != nil {
 		log.Printf("local dial error: %v", err)
 		dconn.Close()
 		return
 	}
 	defer localConn.Close()
-	if err := pipeEncrypted(localConn, dconn, tc.cfg.Secret); err != nil {
+	if err := pipeEncrypted(localConn, dconn, tc.Cfg.Secret); err != nil {
 		log.Printf("pipe error: %v", err)
 	}
 }
@@ -249,7 +251,7 @@ func sendAuth(conn net.Conn, secret string) bool {
 }
 
 func (ts *TunnelServer) verifyAuth(conn net.Conn) bool {
-	expected := sha256.Sum256([]byte(ts.cfg.Secret))
+	expected := sha256.Sum256([]byte(ts.Cfg.Secret))
 	var got [32]byte
 	if _, err := io.ReadFull(conn, got[:]); err != nil {
 		log.Printf("auth read error: %v", err)
@@ -299,7 +301,7 @@ func pipeEncrypted(a, b net.Conn, secret string) error {
 		errCh <- err
 	}()
 	go func() {
-		_, err := io.Copy(cipher.StreamReader{S: streamB, R: b}, a)
+		_, err := io.Copy(a, cipher.StreamReader{S: streamB, R: b})
 		errCh <- err
 	}()
 	err1 := <-errCh

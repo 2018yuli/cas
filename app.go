@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"crypto/tls"
@@ -37,6 +37,7 @@ func (a *App) RegisterRoutes(s *ghttp.Server) {
 		g.Middleware(ghttp.MiddlewareCORS)
 		g.GET("/", a.RenderLoginPage)
 		g.GET("/portal", a.RenderPortalPage) // HTML
+		g.GET("/sync/webtops", a.HandleSyncWebtops)
 		g.POST("/login", a.HandleLogin)
 		g.POST("/logout", a.HandleLogout)
 		g.GET("/auth/check", a.HandleAuthCheck)
@@ -199,6 +200,20 @@ func (a *App) HandlePortal(r *ghttp.Request) {
 		"user":    user.Username,
 		"webtops": webtops,
 	})
+}
+
+// HandleSyncWebtops returns all webtops for sync, guarded by X-Sync-Secret (no session required).
+func (a *App) HandleSyncWebtops(r *ghttp.Request) {
+	if syncSecret == "" || r.Header.Get("X-Sync-Secret") != syncSecret {
+		r.Response.WriteStatus(http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	list, err := a.store.ListWebtops()
+	if err != nil {
+		r.Response.WriteStatus(http.StatusInternalServerError, "internal error")
+		return
+	}
+	r.Response.WriteJson(list)
 }
 
 // ----- Admin APIs -----

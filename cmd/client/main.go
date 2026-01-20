@@ -4,14 +4,12 @@ import (
 	"context"
 	"log"
 
-	"github.com/gogf/gf/v2/net/ghttp"
-	"github.com/gogf/gf/v2/os/gview"
+	core "webtop-user-center"
 )
 
 func main() {
-	cfg := loadConfig()
-	// client admin still talks to server DB via existing APIs; local DB not needed
-	store, err := NewStore(cfg.DBPath)
+	cfg := core.LoadConfig()
+	store, err := core.NewStore(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("init db: %v", err)
 	}
@@ -20,17 +18,10 @@ func main() {
 	}
 
 	if cfg.TunnelEnabled {
-		tc := &TunnelClient{cfg: cfg.Tunnel}
+		tc := &core.TunnelClient{Cfg: cfg.Tunnel}
 		_ = tc.Start(context.Background())
 	}
 
-	app := NewApp(store)
-	s := ghttp.GetServer()
-	s.SetPort(cfg.Port)
-	view := gview.New()
-	view.AddPath("template")
-	s.SetView(view)
-	app.RegisterRoutes(s)
-	log.Printf("client admin listening on :%d", cfg.Port)
-	s.Run()
+	app := core.NewApp(store)
+	core.RunClient(cfg, app)
 }

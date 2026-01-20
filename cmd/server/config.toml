@@ -1,0 +1,25 @@
+db_path = "data/server-center.db"
+port = 8080
+https_port = 8443
+tls_cert = ""
+tls_key = ""
+
+[admin]
+enabled = true   # server 端默认关闭 admin
+secret = "change-me-admin-secret"
+
+[tunnel]
+enabled = true
+server_addr = "0.0.0.0"
+control_port = 9100
+data_port = 9101
+public_port = 10080
+local_target = "192.168.245.129:3001"
+secret = "change-me-tunnel-secret"
+reconnect_sec = 5
+
+[sync]
+enabled = true
+url = "http://127.0.0.1:10080/sync/webtops"
+secret = "123"
+interval_sec = 300

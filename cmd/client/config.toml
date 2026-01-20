@@ -1,0 +1,22 @@
+db_path = "data/user-center.db"
+port = 8090
+https_port = 8443
+tls_cert = ""
+tls_key = ""
+
+[admin]
+enabled = true
+secret = "" # 留空则用角色校验，非空则请求头需携带 X-Admin-Secret
+
+[tunnel]
+enabled = true
+server_addr = "127.0.0.1"
+control_port = 9100
+data_port = 9101
+public_port = 10080
+local_target = "192.168.245.129:3001"
+secret = "change-me-tunnel-secret"
+reconnect_sec = 5
+
+[sync]
+secret = "123"

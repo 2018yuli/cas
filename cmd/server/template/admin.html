@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>Webtop 管理</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background: #f5f7fb; margin: 0; padding: 0; }
+    header { background: #409EFF; color: #fff; padding: 16px; display: flex; justify-content: space-between; align-items: center; }
+    h1 { margin: 0; font-size: 20px; }
+    main { padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    section { background: #fff; border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,0.08); padding: 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #ebeef5; padding: 8px; text-align: left; font-size: 13px; }
+    th { background: #f5f7fa; }
+    input, button { padding: 8px; margin: 4px 0; }
+    button { background: #409EFF; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    button.danger { background: #f56c6c; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .msg { color: #f56c6c; min-height: 18px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Webtop 管理</h1>
+    <div class="row">
+      <button onclick="location.href='/portal'">返回门户</button>
+      <button class="danger" id="logout">退出</button>
+    </div>
+  </header>
+  <main>
+    <section>
+      <h2>用户</h2>
+      <div class="row">
+        <input id="newUser" placeholder="用户名" />
+        <input id="newPass" type="password" placeholder="密码" />
+        <button id="createUser">创建用户(自动 user 角色)</button>
+      </div>
+      <div id="userMsg" class="msg"></div>
+      <table>
+        <thead><tr><th>ID</th><th>用户名</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="userTable"></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Webtop</h2>
+      <div class="row">
+        <input id="wtName" placeholder="名称" />
+        <input id="wtURL" placeholder="URL 如 http://192.168.1.10:3000" style="width:260px;" />
+        <button id="createWT">新增</button>
+      </div>
+      <div id="wtMsg" class="msg"></div>
+      <table>
+        <thead><tr><th>ID</th><th>名称</th><th>URL</th><th>启用</th><th>操作</th></tr></thead>
+        <tbody id="wtTable"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    async function fetchJSON(url, opts={}) {
+      const res = await fetch(url, { credentials: 'include', ...opts });
+      if (!res.ok) throw new Error(await res.text() || res.statusText);
+      return res.json();
+    }
+
+    async function loadUsers() {
+      const tbody = document.getElementById('userTable');
+      tbody.innerHTML = '';
+      try {
+        const data = await fetchJSON('/admin/users');
+        data.forEach(u => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${u.id}</td>
+            <td>${u.username}</td>
+            <td>${u.disabled ? '已禁用' : '正常'}</td>
+            <td class="row">
+              <input type="password" placeholder="新密码" data-uid="${u.id}" style="width:120px;">
+              <button data-action="setpass" data-id="${u.id}">改密</button>
+              <button data-action="toggle" data-id="${u.id}">${u.disabled ? '启用' : '禁用'}</button>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        });
+      } catch (e) {
+        document.getElementById('userMsg').textContent = e.message;
+      }
+    }
+
+    async function loadWebtops() {
+      const tbody = document.getElementById('wtTable');
+      tbody.innerHTML = '';
+      try {
+        const data = await fetchJSON('/admin/webtops');
+        data.forEach(w => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${w.id}</td>
+            <td><input data-wid="${w.id}" data-field="name" value="${w.name}" style="width:100px;"></td>
+            <td><input data-wid="${w.id}" data-field="url" value="${w.target_url}" style="width:240px;"></td>
+            <td><input type="checkbox" data-wid="${w.id}" data-field="enabled" ${w.enabled ? 'checked' : ''}></td>
+            <td><button data-action="savewt" data-id="${w.id}">保存</button></td>
+          `;
+          tbody.appendChild(tr);
+        });
+      } catch (e) {
+        document.getElementById('wtMsg').textContent = e.message;
+      }
+    }
+
+    document.getElementById('createUser').onclick = async () => {
+      const u = document.getElementById('newUser').value.trim();
+      const p = document.getElementById('newPass').value;
+      const msg = document.getElementById('userMsg');
+      msg.textContent = '';
+      try {
+        if (!u || !p) throw new Error('请输入用户名和密码');
+        await fetchJSON('/admin/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: u, password: p })
+        });
+        document.getElementById('newPass').value = '';
+        await loadUsers();
+      } catch (e) {
+        msg.textContent = e.message;
+      }
+    };
+
+    document.getElementById('userTable').onclick = async (ev) => {
+      const btn = ev.target.closest('button');
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const action = btn.dataset.action;
+      const msg = document.getElementById('userMsg');
+      msg.textContent = '';
+      try {
+        if (action === 'setpass') {
+          const input = document.querySelector(`input[data-uid="${id}"]`);
+          const pwd = input.value;
+          if (!pwd) throw new Error('请输入新密码');
+          await fetchJSON(`/admin/users/${id}/password`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: pwd })
+          });
+          input.value = '';
+        } else if (action === 'toggle') {
+          const row = btn.closest('tr');
+          const disabledText = row.children[2].textContent.includes('禁用');
+          await fetchJSON(`/admin/users/${id}/disable`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ disabled: !disabledText })
+          });
+        }
+        await loadUsers();
+      } catch (e) {
+        msg.textContent = e.message;
+      }
+    };
+
+    document.getElementById('createWT').onclick = async () => {
+      const name = document.getElementById('wtName').value.trim();
+      const url = document.getElementById('wtURL').value.trim();
+      const msg = document.getElementById('wtMsg');
+      msg.textContent = '';
+      try {
+        if (!name || !url) throw new Error('请输入名称和URL');
+        await fetchJSON('/admin/webtops', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, target_url: url, enabled: true })
+        });
+        await loadWebtops();
+      } catch (e) {
+        msg.textContent = e.message;
+      }
+    };
+
+    document.getElementById('wtTable').onclick = async (ev) => {
+      const btn = ev.target.closest('button');
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const msg = document.getElementById('wtMsg');
+      msg.textContent = '';
+      try {
+        const name = document.querySelector(`input[data-wid="${id}"][data-field="name"]`).value;
+        const url = document.querySelector(`input[data-wid="${id}"][data-field="url"]`).value;
+        const enabled = document.querySelector(`input[data-wid="${id}"][data-field="enabled"]`).checked;
+        await fetchJSON(`/admin/webtops/${id}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, target_url: url, enabled })
+        });
+        await loadWebtops();
+      } catch (e) {
+        msg.textContent = e.message;
+      }
+    };
+
+    document.getElementById('logout').onclick = async () => {
+      await fetch('/logout', { method: 'POST', credentials: 'include' });
+      location.href = '/';
+    };
+
+    loadUsers();
+    loadWebtops();
+  </script>
+</body>
+</html>

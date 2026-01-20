@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"database/sql"
@@ -404,4 +404,43 @@ func (s *Store) CreateWebtop(name, url string, enabled bool) (int64, error) {
 func (s *Store) UpdateWebtop(id int64, name, target string, enabled bool) error {
 	_, err := s.db.Exec(`UPDATE webtops SET name = ?, target_url = ?, enabled = ? WHERE id = ?`, name, target, enabled, id)
 	return err
+}
+
+func (s *Store) ReplaceWebtops(webtops []Webtop) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	adminRoleID, err := s.ensureRoleTx(tx, defaultAdminRole)
+	if err != nil {
+		return err
+	}
+	userRoleID, err := s.ensureRoleTx(tx, "user")
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`DELETE FROM role_webtops`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM webtops`); err != nil {
+		return err
+	}
+
+	for _, w := range webtops {
+		res, err := tx.Exec(`INSERT INTO webtops(name, target_url, enabled) VALUES(?, ?, ?)`, w.Name, w.TargetURL, w.Enabled)
+		if err != nil {
+			return err
+		}
+		wid, _ := res.LastInsertId()
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO role_webtops(role_id, webtop_id) VALUES(?, ?)`, adminRoleID, wid); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO role_webtops(role_id, webtop_id) VALUES(?, ?)`, userRoleID, wid); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
