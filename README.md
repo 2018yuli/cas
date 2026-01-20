@@ -3,6 +3,8 @@
 
 # Webtop User Center
 
+![Portal Home](docs/02index.png)
+
 Webtop is a great browser-based desktop, but it ships without a lightweight user/admin portal. This project adds a GoFrame-based portal plus an embedded tunnel reverse-proxy so you can:
 
 - Authenticate users, lock out brute-force logins, and manage accounts.
