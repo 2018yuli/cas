@@ -1,0 +1,6 @@
+displayName: WebtopAuth
+type: middleware
+import: webtop-user-center/traefikplugins/webtopauth
+summary: "ForwardAuth-like middleware that delegates auth to the user-center /auth/check"
+testData:
+  authURL: "http://user-center:8080/auth/check"

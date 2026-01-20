@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  traefik:
+    image: traefik:v3.1
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - public
+      - internal
+
+  user-center:
+    build: .
+    environment:
+      - DB_PATH=/data/user-center.db
+      - SESSION_TTL=8h
+    volumes:
+      - ./data:/data
+    networks:
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.usercenter.rule=PathPrefix(`/portal`) || PathPrefix(`/login`) || PathPrefix(`/logout`) || PathPrefix(`/auth`)"
+      - "traefik.http.routers.usercenter.entrypoints=web"
+      - "traefik.http.services.usercenter.loadbalancer.server.port=8080"
+
+  webtop1:
+    image: linuxserver/webtop
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Shanghai
+    networks:
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.webtop1.rule=PathPrefix(`/webtop/1`)"
+      - "traefik.http.routers.webtop1.entrypoints=web"
+      - "traefik.http.routers.webtop1.middlewares=auth,strip-w1"
+      - "traefik.http.services.webtop1.loadbalancer.server.port=3000"
+      - "traefik.http.middlewares.auth.forwardauth.address=http://user-center:8080/auth/check"
+      - "traefik.http.middlewares.auth.forwardauth.trustforwardheader=true"
+      - "traefik.http.middlewares.strip-w1.stripprefix.prefixes=/webtop/1"
+    shm_size: "1gb"
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+networks:
+  public:
+  internal:
